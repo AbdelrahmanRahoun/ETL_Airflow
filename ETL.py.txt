@@ -1,0 +1,87 @@
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.transfers.local_to_gcs import LocalFilesystemToGCSOperator
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from datetime import datetime, timedelta
+
+default_args = {
+    'owner': 'rahoun',
+    'start_date': datetime(2025, 6, 1),
+    'email': ['rahoun@example.com'],
+    'email_on_failure': True,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+    'sla': timedelta(minutes=90)
+}
+
+with DAG(
+    dag_id='national_toll_etl_pipeline',
+    default_args=default_args,
+    description='Daily ETL pipeline for toll data from multiple formats to BigQuery',
+    schedule_interval='@daily',
+    catchup=False
+) as dag:
+
+    # 1. Unzip data
+    unzip_data = BashOperator(
+        task_id='unzip_data',
+        bash_command='tar -xzf /home/airflow/dags/data/tolldata.tgz -C /home/airflow/dags/data/raw'
+    )
+
+    # 2. Extract CSV
+    extract_csv = BashOperator(
+        task_id='extract_csv',
+        bash_command="cut -d',' -f1-4 /home/airflow/dags/data/raw/vehicle-data.csv > /home/airflow/dags/data/staging/csv_data.csv"
+    )
+
+    # 3. Extract TSV
+    extract_tsv = BashOperator(
+        task_id='extract_tsv',
+        bash_command="cut -f5-7 /home/airflow/dags/data/raw/tollplaza-data.tsv > /home/airflow/dags/data/staging/tsv_data.csv"
+    )
+
+    # 4. Extract Fixed-width
+    extract_fixed_width = BashOperator(
+        task_id='extract_fixed',
+        bash_command="cut -c59-67 /home/airflow/dags/data/raw/payment-data.txt > /home/airflow/dags/data/staging/fixed_width_data.csv"
+    )
+
+    # 5. Consolidate
+    consolidate = BashOperator(
+        task_id='consolidate',
+        bash_command="paste -d',' /home/airflow/dags/data/staging/csv_data.csv "
+                     "/home/airflow/dags/data/staging/tsv_data.csv "
+                     "/home/airflow/dags/data/staging/fixed_width_data.csv "
+                     "> /home/airflow/dags/data/staging/extracted_data.csv"
+    )
+
+    # 6. Transform (uppercase vehicle_type)
+    transform = BashOperator(
+        task_id='transform',
+        bash_command="awk -F',' 'BEGIN{OFS=\",\"} {$4=toupper($4)}1' /home/airflow/dags/data/staging/extracted_data.csv "
+                     "> /home/airflow/dags/data/transformed/transformed_data.csv"
+    )
+
+    # 7. Upload to GCS
+    upload_to_gcs = LocalFilesystemToGCSOperator(
+        task_id='upload_to_gcs',
+        src='/home/airflow/dags/data/transformed/transformed_data.csv',
+        dst='etl_output/transformed_data.csv',
+        bucket='toll-data-bucket',
+    )
+
+    # 8. Load to BigQuery
+    load_to_bq = GCSToBigQueryOperator(
+        task_id='load_to_bq',
+        bucket='toll-data-bucket',
+        source_objects=['etl_output/transformed_data.csv'],
+        destination_project_dataset_table='my_project.my_dataset.toll_data',
+        source_format='CSV',
+        skip_leading_rows=0,
+        write_disposition='WRITE_TRUNCATE',
+    )
+
+    # Define pipeline order
+    unzip_data >> [extract_csv, extract_tsv, extract_fixed_width]
+    [extract_csv, extract_tsv, extract_fixed_width] >> consolidate >> transform >> upload_to_gcs >> load_to_bq
